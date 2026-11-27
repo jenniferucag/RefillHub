@@ -1,0 +1,295 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function activeUser() {
+      return signedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isActive == true;
+    }
+
+    function admin() {
+      return activeUser()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function orderType(data) {
+      return data.keys().hasAny(['orderType']) ? data.orderType : 'purchase';
+    }
+
+    function validStatusTransition(oldStatus, newStatus, orderType) {
+      return (oldStatus == 'Pending' && (newStatus == 'Confirmed' || newStatus == 'Cancelled'))
+        || (oldStatus == 'Confirmed'
+          && (newStatus == 'Cancelled'
+            || (orderType == 'refill' && newStatus == 'Picked Up')
+            || (orderType == 'purchase' && newStatus == 'Preparing')))
+        || (orderType == 'refill' && oldStatus == 'Picked Up'
+          && (newStatus == 'Preparing' || newStatus == 'Cancelled'))
+        || (oldStatus == 'Preparing' && newStatus == 'Out for Delivery')
+        || (oldStatus == 'Out for Delivery' && newStatus == 'Delivered');
+    }
+
+    function validAdminSchedules() {
+      return request.resource.data.deliveryScheduledAt is timestamp
+        && (orderType(request.resource.data) != 'refill'
+          || (request.resource.data.pickupScheduledAt is timestamp
+            && request.resource.data.deliveryScheduledAt
+              > request.resource.data.pickupScheduledAt));
+    }
+
+    function validOrderItem(item, mayBeUnpriced) {
+      return item is map
+        && item.keys().hasAll([
+          'waterType', 'productName', 'sizeLabel', 'unitPrice', 'quantity', 'lineTotal'
+        ])
+        && item.keys().hasOnly([
+          'waterType', 'productName', 'sizeLabel', 'unitPrice', 'quantity', 'lineTotal'
+        ])
+        && item.waterType is string && item.waterType.size() > 0
+        && item.productName is string && item.productName.size() > 0
+        && item.sizeLabel is string && item.sizeLabel.size() > 0
+        && item.quantity is int && item.quantity >= 1 && item.quantity <= 99
+        && (
+          (mayBeUnpriced && item.unitPrice == null && item.lineTotal == null)
+          || (item.unitPrice is number && item.unitPrice > 0
+            && item.lineTotal is number && item.lineTotal > 0
+            && item.lineTotal == item.unitPrice * item.quantity)
+        );
+    }
+
+    function validCustomerOrderCreate() {
+      let data = request.resource.data;
+      let profile = get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
+      return data.keys().hasAll([
+          'orderNumber', 'customerId', 'customerName', 'phone', 'address',
+          'notes', 'orderType', 'pickupRequestedAt', 'pickupScheduledAt',
+          'deliveryRequestedAt', 'deliveryScheduledAt', 'items', 'totalAmount',
+          'paymentMethod', 'status', 'statusHistory', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'orderNumber', 'customerId', 'customerName', 'phone', 'address',
+          'notes', 'orderType', 'waterType', 'containerSize', 'containerCount',
+          'pickupRequestedAt', 'pickupScheduledAt', 'deliveryRequestedAt',
+          'deliveryScheduledAt', 'items', 'totalAmount', 'paymentMethod',
+          'status', 'statusHistory', 'createdAt', 'updatedAt'
+        ])
+        && data.customerId == request.auth.uid
+        && data.customerName == profile.name
+        && data.orderNumber is string
+        && data.orderNumber.matches('^RH-[0-9]{8}-[0-9]{4}$')
+        && data.phone is string && data.phone.size() > 0
+        && data.address is string && data.address.size() > 0
+        && data.notes is string
+        && data.orderType in ['refill', 'purchase']
+        && data.paymentMethod == 'Cash on Delivery'
+        && data.status == 'Pending'
+        && data.pickupScheduledAt == null
+        && data.deliveryScheduledAt == null
+        && data.deliveryRequestedAt is timestamp
+        && data.deliveryRequestedAt > request.time
+        && data.items is list && data.items.size() > 0
+        && validOrderItem(data.items[0], data.orderType == 'refill')
+        && data.statusHistory is list
+        && data.statusHistory.size() == 1
+        && data.statusHistory[0].keys().hasAll(['status', 'timestamp', 'changedBy'])
+        && data.statusHistory[0].keys().hasOnly(['status', 'timestamp', 'changedBy'])
+        && data.statusHistory[0].status == 'Pending'
+        && data.statusHistory[0].timestamp is timestamp
+        && data.statusHistory[0].changedBy == request.auth.uid
+        && data.createdAt == request.time
+        && data.updatedAt == request.time
+        && (
+          (data.orderType == 'refill'
+            && data.keys().hasAll(['waterType', 'containerSize', 'containerCount'])
+            && data.waterType is string && data.waterType.size() > 0
+            && data.containerSize is string && data.containerSize.size() > 0
+            && data.containerCount is int
+            && data.containerCount >= 1 && data.containerCount <= 99
+            && data.pickupRequestedAt is timestamp
+            && data.pickupRequestedAt >= request.time
+            && data.deliveryRequestedAt > data.pickupRequestedAt
+            && data.items[0].waterType == data.waterType
+            && data.items[0].sizeLabel == data.containerSize
+            && data.items[0].quantity == data.containerCount
+            && (data.totalAmount == null || data.totalAmount is string))
+          || (data.orderType == 'purchase'
+            && !data.keys().hasAny(['waterType', 'containerSize', 'containerCount'])
+            && data.pickupRequestedAt == null
+            && data.totalAmount is string && data.totalAmount.size() > 0)
+        );
+    }
+
+    function validStatusHistoryAppend(changedByUid) {
+      let history = request.resource.data.statusHistory;
+      let previousHistory = resource.data.statusHistory;
+      let entry = history[previousHistory.size()];
+      return history is list
+        && previousHistory is list
+        && history.size() == previousHistory.size() + 1
+        && history.hasAll(previousHistory)
+        && entry.status == request.resource.data.status
+        && entry.timestamp == request.resource.data.updatedAt
+        && entry.changedBy == changedByUid;
+    }
+
+    match /users/{uid} {
+      // Inactive users must be able to read their own status in order to sign out.
+      allow get: if signedIn() && (request.auth.uid == uid || admin());
+      allow list: if admin();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['role', 'isActive', 'fullName', 'name', 'phone', 'address', 'email'])
+        && request.resource.data.keys().hasAll(['role', 'isActive', 'fullName', 'name', 'phone', 'address', 'email'])
+        && request.resource.data.role == 'customer'
+        && request.resource.data.isActive == true
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() > 0
+        && request.resource.data.name is string
+        && request.resource.data.phone is string
+        && request.resource.data.address is string
+        && request.resource.data.email is string;
+
+      allow update: if activeUser()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fullName', 'name', 'phone', 'address'])
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() > 0
+        && request.resource.data.name is string
+        && request.resource.data.phone is string
+        && request.resource.data.address is string;
+
+      allow update: if admin()
+        && request.auth.uid != uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isActive'])
+        && request.resource.data.isActive is bool;
+    }
+
+    match /products/{productId} {
+      allow read: if (signedIn() && resource.data.isActive == true) || admin();
+      function validProduct(data) {
+        return data.keys().hasAll(['name', 'waterType', 'description', 'isActive', 'createdAt', 'sizes'])
+          && data.name is string && data.name.size() > 0
+          && data.waterType is string && data.waterType.size() > 0
+          && data.description is string
+          && (!('imageUrl' in data) || data.imageUrl == null || data.imageUrl is string)
+          && (!('imageBase64' in data) || data.imageBase64 == null || data.imageBase64 is string)
+          && data.isActive is bool
+          && data.createdAt is timestamp
+          && data.sizes is list;
+      }
+      allow create: if admin() && validProduct(request.resource.data)
+        && request.resource.data.keys().hasOnly(['name', 'waterType', 'description', 'imageUrl', 'imageBase64', 'isActive', 'createdAt', 'sizes']);
+      allow update: if admin() && validProduct(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'waterType', 'description', 'imageUrl', 'imageBase64', 'sizes', 'isActive']);
+      allow delete: if false;
+    }
+
+    match /orders/{orderId} {
+      // Customers may create only their own initially pending order.
+      allow create: if activeUser() && validCustomerOrderCreate();
+
+      // Customers can read only their own orders
+      allow read: if activeUser()
+        && resource.data.customerId == request.auth.uid;
+
+      // Admins can read all orders
+      allow read: if admin();
+
+      // Customers can update only to cancel a 'Pending' order
+      allow update: if activeUser()
+        && resource.data.customerId == request.auth.uid
+        && resource.data.status == 'Pending'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'statusHistory', 'updatedAt'])
+        && request.resource.data.status == 'Cancelled'
+        && validStatusTransition(
+          resource.data.status,
+          request.resource.data.status,
+          orderType(resource.data)
+        )
+        && request.resource.data.updatedAt is timestamp
+        && validStatusHistoryAppend(request.auth.uid);
+
+      // Admins can advance an order by one state or update its delivery person.
+      allow update: if admin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'statusHistory', 'updatedAt', 'deliveryPerson',
+          'cancellationReason',
+          'pickupScheduledAt', 'deliveryScheduledAt', 'totalAmount'
+        ])
+        && request.resource.data.updatedAt is timestamp
+        && (
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasAll([
+              'status', 'statusHistory', 'updatedAt'
+            ])
+            && validStatusTransition(
+              resource.data.status,
+              request.resource.data.status,
+              orderType(resource.data)
+            )
+            && validStatusHistoryAppend(request.auth.uid)
+            && (request.resource.data.status != 'Cancelled'
+              || (request.resource.data.cancellationReason is string
+                && request.resource.data.cancellationReason.size() > 0))
+            && (request.resource.data.status == 'Cancelled'
+              || !request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(['cancellationReason']))
+            && (request.resource.data.status != 'Confirmed'
+              || validAdminSchedules())
+          )
+          || (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['status', 'statusHistory'])
+            && request.resource.data.diff(resource.data).affectedKeys().hasAny(['deliveryPerson'])
+            && request.resource.data.status == resource.data.status
+            && request.resource.data.statusHistory == resource.data.statusHistory
+            && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['cancellationReason'])
+            && (!request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['pickupScheduledAt', 'deliveryScheduledAt', 'totalAmount'])
+              || resource.data.status == 'Confirmed')
+          )
+        )
+        && (!('deliveryPerson' in request.resource.data.diff(resource.data).affectedKeys()) || request.resource.data.deliveryPerson is string);
+
+      // No deletes for anyone
+      allow delete: if false;
+    }
+
+    match /business_info/{documentId} {
+      function validBusinessInfo(data) {
+        return data.keys().hasAll([
+            'businessName', 'about', 'contactPhone', 'contactEmail',
+            'address', 'operatingHours', 'deliveryCoverage', 'deliveryPolicy',
+            'scheduleNotes', 'orderingGuideSteps'
+          ])
+          && data.businessName is string
+          && data.about is string
+          && data.contactPhone is string
+          && data.contactEmail is string
+          && data.address is string
+          && data.operatingHours is string
+          && data.deliveryCoverage is string
+          && data.deliveryPolicy is string
+          && data.scheduleNotes is string
+          && data.orderingGuideSteps is list;
+      }
+
+      allow read: if signedIn() && documentId == 'main';
+      allow create, update: if admin()
+        && documentId == 'main'
+        && validBusinessInfo(request.resource.data);
+
+      // No deletes
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

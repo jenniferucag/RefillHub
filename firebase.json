@@ -1,0 +1,25 @@
+{
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "flutter": {
+    "platforms": {
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "refillhub-93811",
+          "configurations": {
+            "android": "1:474037325172:android:8e9a5eecaf88bc9069f021",
+            "web": "1:474037325172:web:2faea722d3114cec69f021"
+          }
+        }
+      },
+      "android": {
+        "default": {
+          "projectId": "refillhub-93811",
+          "appId": "1:474037325172:android:8e9a5eecaf88bc9069f021",
+          "fileOutput": "android/app/google-services.json"
+        }
+      }
+    }
+  }
+}
